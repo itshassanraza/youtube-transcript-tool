@@ -65,12 +65,7 @@ class AIService:
         self.gemini_url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent"
         self.openrouter_url = "https://openrouter.ai/api/v1/chat/completions"
 
-    def _handle_api_error(self, error: Exception, service_name: str):
-        """Log and handle API errors"""
-        logger.error("%s API error: %s", service_name, str(error))
-        return None
-
-     def analyze_with_gemini(self, text: str) -> Optional[str]:
+    def analyze_with_gemini(self, text: str) -> Optional[str]:
         """Analyze text using Google's Gemini API"""
         for attempt in range(MAX_RETRIES):
             try:
@@ -119,12 +114,10 @@ class AIService:
         except Exception as e:
             return self._handle_api_error(e, "OpenRouter")
 
-    def analyze_content(self, text: str) -> str:
-        """Get analysis from available AI services"""
-        result = self.analyze_with_gemini(text)
-        if not result:
-            result = self.analyze_with_openrouter(text)
-        return result or "Analysis unavailable - please try again later"
+    def _handle_api_error(self, error: Exception, service_name: str) -> None:
+        """Log and handle API errors"""
+        logger.error("%s API error: %s", service_name, str(error))
+        return None
 
 class YouTubeClient:
     """Handles YouTube API interactions"""
