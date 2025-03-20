@@ -4,3 +4,4 @@ textblob
 requests
 pandas
 python-dotenv
+plotly
