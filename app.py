@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 # Configuration constants
 MAX_RESULTS = 10
-APP_VERSION = "2.1"
+APP_VERSION = "2.2"
 CREATED_BY = "Your Name"
 CREATED_DATE = datetime.now().strftime("%Y-%m-%d")
 MAX_RETRIES = 3
@@ -88,7 +88,8 @@ class AIService:
                     return None
                 time.sleep(RETRY_DELAY)
             except Exception as e:
-                return self._handle_api_error(e, "Gemini")
+                logger.error("Gemini API error: %s", str(e))
+                return None
         return None
 
     def analyze_with_openrouter(self, text: str) -> Optional[str]:
@@ -112,12 +113,8 @@ class AIService:
             )
             return response.json()['choices'][0]['message']['content'] if response.ok else None
         except Exception as e:
-            return self._handle_api_error(e, "OpenRouter")
-
-    def _handle_api_error(self, error: Exception, service_name: str) -> None:
-        """Log and handle API errors"""
-        logger.error("%s API error: %s", service_name, str(error))
-        return None
+            logger.error("OpenRouter API error: %s", str(e))
+            return None
 
 class YouTubeClient:
     """Handles YouTube API interactions"""
@@ -146,7 +143,8 @@ class YouTubeClient:
             "part": "snippet",
             "q": query,
             "type": "video",
-            "maxResults": max_results
+            "maxResults": max_results,
+            "fields": "items(id(videoId),snippet(title,description))"
         })
         return result.get("items", []) if result else []
 
@@ -218,12 +216,46 @@ class AnalysisEngine:
         self.ai = ai_service
         self.analysis_cache = {}
 
+    def _calculate_relevance(self, query: str, title: str, description: str, summary: str) -> float:
+        """Improved relevance scoring using multiple factors"""
+        try:
+            query = query.lower().strip()
+            if not query:
+                return 0
+            
+            # Combine content sources
+            content = f"{title} {description} {summary}".lower()
+            query_words = set(query.split())
+            content_words = set(content.split())
+            
+            # Exact matches
+            exact_matches = len(query_words & content_words)
+            
+            # Partial matches (substring matches)
+            partial_matches = sum(
+                1 for q_word in query_words 
+                if any(q_word in c_word for c_word in content_words)
+            )
+            
+            # Combine scores with weighting
+            total_score = (exact_matches * 0.8) + (partial_matches * 0.2)
+            max_possible = len(query_words)
+            
+            return total_score / max_possible if max_possible > 0 else 0
+            
+        except Exception as e:
+            logger.error(f"Relevance calculation error: {str(e)}")
+            return 0
+
     def full_analysis(self, query: str, max_results: int) -> List[Dict]:
         """Optimized analysis workflow with progress tracking"""
+        if not query.strip():
+            return []
+
         try:
             videos = self.youtube.search_videos(query, max_results)
             if not videos:
-                logger.warning("No videos found for query: %s", query)
+                logger.info("YouTube API returned no videos for query: %s", query)
                 return []
 
             results = []
@@ -243,13 +275,17 @@ class AnalysisEngine:
                     else:
                         analysis = self._analyze_video(video, query)
                         self.analysis_cache[video_id] = analysis
-                        results.append(analysis)
+                        if analysis.get('relevance', 0) >= 0.1:
+                            results.append(analysis)
 
                 except Exception as e:
                     logger.error("Error analyzing video %s: %s", video_id, str(e))
                     continue
 
-            return results
+            return sorted(results, key=lambda x: x["relevance"], reverse=True)
+        except Exception as e:
+            logger.error("Analysis failed: %s", str(e))
+            return []
         finally:
             progress.empty()
             status_text.empty()
@@ -258,14 +294,23 @@ class AnalysisEngine:
         """Optimized video analysis with timeout handling"""
         video_id = video["id"]["videoId"]
         title = video["snippet"]["title"]
-        
+        description = video["snippet"]["description"]
+
         try:
             with ThreadPoolExecutor(max_workers=1) as executor:
                 future = executor.submit(self._full_video_analysis, video_id, title)
-                return future.result(timeout=45)
+                result = future.result(timeout=45)
+            
+            result["relevance"] = self._calculate_relevance(
+                query, title, description, result["analysis"].get("summary", "")
+            )
+            return result
         except TimeoutError:
             logger.warning("Analysis timeout for video: %s", video_id)
             return self._create_video_result(video_id, title, "timeout")
+        except Exception as e:
+            logger.error("Analysis failed: %s", str(e))
+            return self._create_video_result(video_id, title, f"error: {str(e)}")
 
     def _full_video_analysis(self, video_id: str, title: str) -> Dict:
         """Core analysis with fallback mechanisms"""
@@ -275,12 +320,10 @@ class AnalysisEngine:
             comments = self.youtube.get_video_comments(video_id)
             sentiment = self._calculate_sentiment(comments)
             
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                summary_future = executor.submit(
-                    self.ai.analyze_content,
-                    f"Title: {title}\nTranscript: {transcript[:1500]}"
-                )
-                summary = summary_future.result(timeout=30)
+            # Get summary with fallback
+            summary = self.ai.analyze_with_gemini(f"Title: {title}\nTranscript: {transcript[:1500]}")
+            if not summary:
+                summary = self.ai.analyze_with_openrouter(f"Title: {title}\nTranscript: {transcript[:1500]}") or "No summary available"
 
             return self._create_video_result(
                 video_id,
@@ -303,6 +346,7 @@ class AnalysisEngine:
             "video_id": video_id,
             "title": title,
             "status": status,
+            "relevance": kwargs.get("relevance", 0),
             "analysis": {
                 "stats": kwargs.get("stats", {"views": 0, "likes": 0, "comments": 0}),
                 "summary": kwargs.get("summary", "No analysis available"),
@@ -357,11 +401,21 @@ def setup_sidebar() -> tuple:
     st.sidebar.subheader("Analysis Parameters")
     
     max_results = st.sidebar.slider("Max Results", 5, 50, MAX_RESULTS)
-    min_relevance = st.sidebar.slider("Min Relevance Score", 0.0, 1.0, 0.5)
+    min_relevance = st.sidebar.slider("Min Relevance Score", 0.0, 1.0, 0.2)
     
     st.sidebar.markdown("---")
     st.sidebar.markdown(f"**Version:** {APP_VERSION} | **By:** {CREATED_BY}")
     st.sidebar.markdown(f"**Last Updated:** {CREATED_DATE}")
+    
+    # Add diagnostic section
+    if st.sidebar.checkbox("Show Diagnostics"):
+        st.sidebar.subheader("Diagnostics")
+        test_query = st.sidebar.text_input("Test query")
+        test_title = st.sidebar.text_input("Test title")
+        if test_query and test_title:
+            analyzer = get_analyzer()
+            score = analyzer._calculate_relevance(test_query, test_title, "", "")
+            st.sidebar.metric("Calculated Relevance", f"{score:.2f}")
     
     return max_results, min_relevance
 
@@ -374,6 +428,7 @@ def display_video(video: dict):
         
         with col2:
             st.subheader(video["title"])
+            st.caption(f"Relevance score: {video.get('relevance', 0):.2f}")
             stats = video["analysis"]["stats"]
             
             st.metric("Engagement Score", 
