@@ -217,28 +217,106 @@ class TranscriptService:
         """Clean and format transcript"""
         return " ".join(entry["text"] for entry in transcript)[:MAX_TRANSCRIPT_LENGTH]
 
-class AnalysisEngine:
-    """Main analysis workflow controller"""
+class class AnalysisEngine:
     def __init__(self, youtube_client: YouTubeClient, ai_service: AIService):
         self.youtube = youtube_client
         self.ai = ai_service
+        self.analysis_cache = {}
 
     def full_analysis(self, query: str, max_results: int) -> List[Dict]:
-        """Complete analysis workflow"""
-        videos = self.youtube.search_videos(query, max_results)
-        return [self._analyze_video(video, query) for video in videos]
+        """Optimized analysis workflow with progress tracking"""
+        try:
+            videos = self.youtube.search_videos(query, max_results)
+            if not videos:
+                logger.warning("No videos found for query: %s", query)
+                return []
+
+            results = []
+            progress = st.progress(0)
+            status_text = st.empty()
+            
+            for idx, video in enumerate(videos):
+                try:
+                    status_text.markdown(f"🔍 Analyzing video {idx+1}/{len(videos)}...")
+                    progress.progress((idx+1)/len(videos))
+                    
+                    video_id = video["id"]["videoId"]
+                    cached = self.analysis_cache.get(video_id)
+                    
+                    if cached:
+                        results.append(cached)
+                    else:
+                        analysis = self._analyze_video(video, query)
+                        self.analysis_cache[video_id] = analysis
+                        results.append(analysis)
+                        
+                    # Yield intermediate results
+                    if idx % 2 == 0:
+                        yield results[-1]
+
+                except Exception as e:
+                    logger.error("Error analyzing video %s: %s", video_id, str(e))
+                    continue
+
+            return results
+        finally:
+            progress.empty()
+            status_text.empty()
 
     def _analyze_video(self, video: dict, query: str) -> Dict:
-        """Analyze individual video"""
+        """Optimized video analysis with timeout handling"""
         video_id = video["id"]["videoId"]
         title = video["snippet"]["title"]
         
-        return {
-            "video_id": video_id,
-            "title": title,
-            "analysis": self._get_video_analysis(video_id, title),
-            "relevance": self._calculate_relevance(query, title)
-        }
+        # Fast relevance check before full analysis
+        if not self._quick_relevance_check(query, title):
+            return {
+                "video_id": video_id,
+                "title": title,
+                "status": "skipped (low relevance)"
+            }
+
+        try:
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(self._full_video_analysis, video_id, title)
+                return future.result(timeout=45)  # 45-second timeout
+        except TimeoutError:
+            logger.warning("Analysis timeout for video: %s", video_id)
+            return {
+                "video_id": video_id,
+                "title": title,
+                "status": "timeout"
+            }
+
+    def _full_video_analysis(self, video_id: str, title: str) -> Dict:
+        """Core analysis with fallback mechanisms"""
+        try:
+            transcript = TranscriptService.get_transcript(video_id)
+            stats = self.youtube.get_video_stats(video_id)
+            
+            # Parallelize comment fetching and AI analysis
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                comments_future = executor.submit(self.youtube.get_video_comments, video_id)
+                summary_future = executor.submit(self.ai.analyze_content, f"Title: {title}\nTranscript: {transcript[:1500]}")
+
+                comments = comments_future.result(timeout=20)
+                summary = summary_future.result(timeout=30)
+
+            return {
+                "video_id": video_id,
+                "title": title,
+                "stats": stats,
+                "summary": summary,
+                "comments": comments[:3],
+                "status": "complete"
+            }
+        except Exception as e:
+            logger.error("Full analysis failed: %s", str(e))
+            return {
+                "video_id": video_id,
+                "title": title,
+                "status": f"error: {str(e)}"
+            }
 
     def _get_video_analysis(self, video_id: str, title: str) -> Dict:
         """Get combined video analysis"""
@@ -338,58 +416,39 @@ def display_video(video: dict):
             st.write(video["analysis"]["summary"])
 
 def main():
-    """Main application entry point"""
-    # Initialize services
-    env_vars = check_env_vars()
-    youtube_client = YouTubeClient(env_vars["YOUTUBE_API_KEY"])
-    ai_service = AIService(env_vars["GEMINI_API_KEY"], env_vars["OPENROUTER_API_KEY"])
-    analyzer = AnalysisEngine(youtube_client, ai_service)
-    
-    # Setup UI
+    """Main application with real-time updates"""
     st.title("🎥 YouTube Content Analyzer")
     max_results, min_relevance = setup_sidebar()
     
-    # Search interface
     query = st.text_input("🔍 Enter your search query", key="search_input")
-    if st.button("Analyze Videos", type="primary", use_container_width=True):
-        if query:
-            with st.spinner("🚀 Launching analysis..."):
-                try:
-                    results = analyzer.full_analysis(query, max_results)
-                    relevant_videos = [v for v in results if v["relevance"] >= min_relevance]
+    results_placeholder = st.empty()
+    
+    if st.button("Analyze Videos", type="primary", use_container_width=True) and query:
+        with results_placeholder.container():
+            st.write("🚀 Starting analysis...")
+            
+            try:
+                analyzer = get_analyzer()
+                results_container = st.container()
+                relevant_videos = []
+                
+                for result in analyzer.full_analysis(query, max_results):
+                    if result.get("status") != "complete":
+                        continue
                     
-                    tab1, tab2 = st.tabs(["Video Details", "Summary Report"])
-                    
-                    with tab1:
-                        for video in relevant_videos:
-                            display_video(video)
+                    if result["relevance"] >= min_relevance:
+                        relevant_videos.append(result)
+                        
+                        with results_container:
+                            display_video(result)
                             st.divider()
+                
+                if not relevant_videos:
+                    st.warning("No relevant videos found matching your criteria")
                     
-                    with tab2:
-                        if relevant_videos:
-                            df = pd.DataFrame([{
-                                "Title": v["title"],
-                                "Relevance": v["relevance"],
-                                "Engagement": v["analysis"]["engagement"],
-                                "Link": f"https://youtu.be/{v['video_id']}"
-                            } for v in relevant_videos])
-                            
-                            st.dataframe(
-                                df,
-                                column_config={
-                                    "Link": st.column_config.LinkColumn(),
-                                    "Relevance": st.column_config.ProgressColumn(
-                                        format="%.2f",
-                                        min_value=0,
-                                        max_value=1
-                                    )
-                                },
-                                hide_index=True,
-                                use_container_width=True
-                            )
-                except Exception as e:
-                    st.error(f"Analysis failed: {str(e)}")
-                    logger.exception("Analysis workflow error")
+            except Exception as e:
+                st.error(f"Analysis failed: {str(e)}")
+                logger.exception("Main analysis error")
 
 # Keep-alive and production setup
 def keep_alive():
