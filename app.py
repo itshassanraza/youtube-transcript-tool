@@ -7,9 +7,6 @@ from youtube_transcript_api import YouTubeTranscriptApi
 from textblob import TextBlob
 import os
 
-port = int(os.getenv("PORT", 8080))
-st.set_page_config(page_title="My App", layout="wide")
-st.write("Hello, Streamlit!")
 # Configuration constants
 MAX_RESULTS = 10
 APP_VERSION = "1.0"
@@ -300,4 +297,4 @@ def main():
     st.sidebar.markdown(f"**Version:** {APP_VERSION} | **By:** {CREATED_BY} | **Updated:** {CREATED_DATE}")
 
 if __name__ == "__main__":
-        subprocess.run(["streamlit", "run", "app.py", "--server.port", str(port), "--server.address", "0.0.0.0"])
+    main()
