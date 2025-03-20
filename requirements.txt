@@ -1,8 +1,6 @@
-﻿streamlit
-requests
-pandas
+streamlit
 youtube-transcript-api
 textblob
-google-api-python-client
-bs4
-openai
+requests
+pandas
+python-dotenv
