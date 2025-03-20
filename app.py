@@ -1,5 +1,6 @@
 # app.py
 from streamlit.runtime.scriptrunner import add_script_run_ctx
+from concurrent.futures import ThreadPoolExecutor
 import streamlit as st
 import os
 os.environ["STREAMLIT_GLOBAL_DISABLE_SECRETS_WARNING"] = "true"
@@ -25,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 # Configuration constants
 MAX_RESULTS = 10
-APP_VERSION = "2.0"
+APP_VERSION = "2.1"
 CREATED_BY = "Your Name"
 CREATED_DATE = datetime.now().strftime("%Y-%m-%d")
 MAX_RETRIES = 3
@@ -79,7 +80,6 @@ class AIService:
                         "contents": [{
                             "parts": [{"text": text[:MAX_TRANSCRIPT_LENGTH]}]
                         }],
-                    },
                     params={"key": self.gemini_api_key},
                     headers={"Content-Type": "application/json"},
                     timeout=REQUEST_TIMEOUT
@@ -217,7 +217,8 @@ class TranscriptService:
         """Clean and format transcript"""
         return " ".join(entry["text"] for entry in transcript)[:MAX_TRANSCRIPT_LENGTH]
 
-class class AnalysisEngine:
+class AnalysisEngine:
+    """Main analysis engine with caching and timeout handling"""
     def __init__(self, youtube_client: YouTubeClient, ai_service: AIService):
         self.youtube = youtube_client
         self.ai = ai_service
@@ -249,10 +250,6 @@ class class AnalysisEngine:
                         analysis = self._analyze_video(video, query)
                         self.analysis_cache[video_id] = analysis
                         results.append(analysis)
-                        
-                    # Yield intermediate results
-                    if idx % 2 == 0:
-                        yield results[-1]
 
                 except Exception as e:
                     logger.error("Error analyzing video %s: %s", video_id, str(e))
@@ -268,101 +265,97 @@ class class AnalysisEngine:
         video_id = video["id"]["videoId"]
         title = video["snippet"]["title"]
         
-        # Fast relevance check before full analysis
-        if not self._quick_relevance_check(query, title):
-            return {
-                "video_id": video_id,
-                "title": title,
-                "status": "skipped (low relevance)"
-            }
-
         try:
             with ThreadPoolExecutor(max_workers=1) as executor:
                 future = executor.submit(self._full_video_analysis, video_id, title)
-                return future.result(timeout=45)  # 45-second timeout
+                return future.result(timeout=45)
         except TimeoutError:
             logger.warning("Analysis timeout for video: %s", video_id)
-            return {
-                "video_id": video_id,
-                "title": title,
-                "status": "timeout"
-            }
+            return self._create_video_result(video_id, title, "timeout")
 
     def _full_video_analysis(self, video_id: str, title: str) -> Dict:
         """Core analysis with fallback mechanisms"""
         try:
             transcript = TranscriptService.get_transcript(video_id)
             stats = self.youtube.get_video_stats(video_id)
+            comments = self.youtube.get_video_comments(video_id)
+            sentiment = self._calculate_sentiment(comments)
             
-            # Parallelize comment fetching and AI analysis
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                comments_future = executor.submit(self.youtube.get_video_comments, video_id)
-                summary_future = executor.submit(self.ai.analyze_content, f"Title: {title}\nTranscript: {transcript[:1500]}")
-
-                comments = comments_future.result(timeout=20)
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                summary_future = executor.submit(
+                    self.ai.analyze_content,
+                    f"Title: {title}\nTranscript: {transcript[:1500]}"
+                )
                 summary = summary_future.result(timeout=30)
 
-            return {
-                "video_id": video_id,
-                "title": title,
-                "stats": stats,
-                "summary": summary,
-                "comments": comments[:3],
-                "status": "complete"
-            }
+            return self._create_video_result(
+                video_id,
+                title,
+                "complete",
+                stats=stats,
+                summary=summary,
+                comments=comments[:3],
+                sentiment=sentiment,
+                engagement=self._calculate_engagement(stats),
+                misleading=self._check_content_match(title, transcript)
+            )
         except Exception as e:
             logger.error("Full analysis failed: %s", str(e))
-            return {
-                "video_id": video_id,
-                "title": title,
-                "status": f"error: {str(e)}"
-            }
+            return self._create_video_result(video_id, title, f"error: {str(e)}")
 
-    def _get_video_analysis(self, video_id: str, title: str) -> Dict:
-        """Get combined video analysis"""
-        transcript = TranscriptService.get_transcript(video_id)
-        stats = self.youtube.get_video_stats(video_id)
-        comments = self.youtube.get_video_comments(video_id)
-        
+    def _create_video_result(self, video_id, title, status, **kwargs):
+        """Create standardized video result dictionary"""
         return {
-            "stats": stats,
-            "sentiment": self._calculate_sentiment(comments),
-            "comments": comments[:3],
-            "summary": self.ai.analyze_content(f"Title: {title}\nTranscript: {transcript}"),
-            "engagement": self._calculate_engagement(stats),
-            "misleading": self._check_content_match(title, transcript)
+            "video_id": video_id,
+            "title": title,
+            "status": status,
+            "analysis": {
+                "stats": kwargs.get("stats", {"views": 0, "likes": 0, "comments": 0}),
+                "summary": kwargs.get("summary", "No analysis available"),
+                "comments": kwargs.get("comments", []),
+                "sentiment": kwargs.get("sentiment", "No comments"),
+                "engagement": kwargs.get("engagement", 0),
+                "misleading": kwargs.get("misleading", False)
+            }
         }
-
-    @staticmethod
-    def _calculate_relevance(query: str, title: str) -> float:
-        """Calculate relevance score between query and title"""
-        query_words = set(query.lower().split())
-        title_words = set(title.lower().split())
-        return len(query_words & title_words) / len(query_words) if query_words else 0
-
-    @staticmethod
-    def _calculate_engagement(stats: dict) -> float:
-        """Calculate engagement score"""
-        return ((stats["likes"] + stats["comments"]) / stats["views"]) * 100 if stats["views"] else 0
 
     @staticmethod
     def _calculate_sentiment(comments: list) -> str:
         """Calculate average comment sentiment"""
         if not comments:
             return "No comments"
-        avg = sum(c["sentiment"] for c in comments) / len(comments)
-        return "Positive" if avg > 0 else "Negative" if avg < 0 else "Neutral"
+        try:
+            avg = sum(c["sentiment"] for c in comments) / len(comments)
+            if avg > 0.1:
+                return "Positive"
+            elif avg < -0.1:
+                return "Negative"
+            return "Neutral"
+        except Exception as e:
+            logger.error("Sentiment calculation error: %s", str(e))
+            return "Unknown"
+
+    @staticmethod
+    def _calculate_engagement(stats: dict) -> float:
+        """Calculate engagement score"""
+        try:
+            return ((stats["likes"] + stats["comments"]) / stats["views"]) * 100 if stats["views"] else 0
+        except KeyError:
+            return 0
 
     @staticmethod
     def _check_content_match(title: str, transcript: str) -> bool:
         """Check for content mismatch between title and transcript"""
         if not transcript:
             return False
-        title_keywords = set(title.lower().split())
-        content_keywords = set(transcript.lower().split())
-        return len(title_keywords - content_keywords) / len(title_keywords) > 0.5
+        try:
+            title_keywords = set(title.lower().split())
+            content_keywords = set(transcript.lower().split())
+            return len(title_keywords - content_keywords) / len(title_keywords) > 0.5
+        except Exception as e:
+            logger.error("Content match check error: %s", str(e))
+            return False
 
-# UI Components
 def setup_sidebar() -> tuple:
     """Configure sidebar and return settings"""
     st.sidebar.image("https://www.youtube.com/img/desktop/yt_1200.png", width=100)
@@ -404,16 +397,27 @@ def display_video(video: dict):
             st.caption(f"**Sentiment:** {video['analysis']['sentiment']}")
             
             with st.expander("💬 Top Comments"):
-                for comment in video["analysis"]["comments"]:
-                    icon = "👍" if comment["sentiment"] > 0 else "👎" if comment["sentiment"] < 0 else "🤔"
-                    st.markdown(f"""
-                        **{comment['author']}** {icon}  
-                        {comment['text']}  
-                        *{comment['likes']} likes*
-                    """)
+                comments = video["analysis"]["comments"]
+                if not comments:
+                    st.write("No comments available")
+                else:
+                    for comment in comments:
+                        icon = "👍" if comment.get("sentiment", 0) > 0 else "👎" if comment.get("sentiment", 0) < 0 else "🤔"
+                        st.markdown(f"""
+                            **{comment['author']}** {icon}  
+                            {comment['text']}  
+                            *{comment['likes']} likes*
+                        """)
             
             st.markdown("#### AI Analysis")
             st.write(video["analysis"]["summary"])
+
+def get_analyzer():
+    """Initialize and return analyzer instance"""
+    env_vars = check_env_vars()
+    youtube_client = YouTubeClient(env_vars["YOUTUBE_API_KEY"])
+    ai_service = AIService(env_vars["GEMINI_API_KEY"], env_vars["OPENROUTER_API_KEY"])
+    return AnalysisEngine(youtube_client, ai_service)
 
 def main():
     """Main application with real-time updates"""
@@ -432,13 +436,10 @@ def main():
                 results_container = st.container()
                 relevant_videos = []
                 
-                for result in analyzer.full_analysis(query, max_results):
-                    if result.get("status") != "complete":
-                        continue
-                    
-                    if result["relevance"] >= min_relevance:
+                results = analyzer.full_analysis(query, max_results)
+                for result in results:
+                    if result.get("status") == "complete" and result.get("relevance", 0) >= min_relevance:
                         relevant_videos.append(result)
-                        
                         with results_container:
                             display_video(result)
                             st.divider()
@@ -450,7 +451,6 @@ def main():
                 st.error(f"Analysis failed: {str(e)}")
                 logger.exception("Main analysis error")
 
-# Keep-alive and production setup
 def keep_alive():
     """Maintain application wake status"""
     while True:
@@ -461,13 +461,11 @@ def keep_alive():
             pass
 
 if __name__ == "__main__":
-    # Start keep-alive thread
     t = Thread(target=keep_alive)
     add_script_run_ctx(t)
     t.daemon = True
     t.start()
     
-    # Run main application
     try:
         main()
     except Exception as e:
