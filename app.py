@@ -15,6 +15,7 @@ from threading import Thread
 import time
 import logging
 import sys
+import plotly.express as px
 
 # Configure logging
 logging.basicConfig(
@@ -26,12 +27,12 @@ logger = logging.getLogger(__name__)
 
 # Configuration constants
 MAX_RESULTS = 10
-APP_VERSION = "2.2"
+APP_VERSION = "2.3"
 CREATED_BY = "Your Name"
 CREATED_DATE = datetime.now().strftime("%Y-%m-%d")
 MAX_RETRIES = 3
 RETRY_DELAY = 1
-REQUEST_TIMEOUT = 20
+REQUEST_TIMEOUT = 30
 MAX_TRANSCRIPT_LENGTH = 3000
 
 # Configure page settings
@@ -223,21 +224,16 @@ class AnalysisEngine:
             if not query:
                 return 0
             
-            # Combine content sources
             content = f"{title} {description} {summary}".lower()
             query_words = set(query.split())
             content_words = set(content.split())
             
-            # Exact matches
             exact_matches = len(query_words & content_words)
-            
-            # Partial matches (substring matches)
             partial_matches = sum(
                 1 for q_word in query_words 
                 if any(q_word in c_word for c_word in content_words)
             )
             
-            # Combine scores with weighting
             total_score = (exact_matches * 0.8) + (partial_matches * 0.2)
             max_possible = len(query_words)
             
@@ -320,10 +316,10 @@ class AnalysisEngine:
             comments = self.youtube.get_video_comments(video_id)
             sentiment = self._calculate_sentiment(comments)
             
-            # Get summary with fallback
-            summary = self.ai.analyze_with_gemini(f"Title: {title}\nTranscript: {transcript[:1500]}")
+            summary_prompt = f"Analyze this YouTube video content:\nTitle: {title}\nTranscript: {transcript[:1500]}\nProvide: 1. Summary 2. Main topics 3. Content quality assessment"
+            summary = self.ai.analyze_with_gemini(summary_prompt)
             if not summary:
-                summary = self.ai.analyze_with_openrouter(f"Title: {title}\nTranscript: {transcript[:1500]}") or "No summary available"
+                summary = self.ai.analyze_with_openrouter(summary_prompt) or "No summary available"
 
             return self._create_video_result(
                 video_id,
@@ -407,7 +403,6 @@ def setup_sidebar() -> tuple:
     st.sidebar.markdown(f"**Version:** {APP_VERSION} | **By:** {CREATED_BY}")
     st.sidebar.markdown(f"**Last Updated:** {CREATED_DATE}")
     
-    # Add diagnostic section
     if st.sidebar.checkbox("Show Diagnostics"):
         st.sidebar.subheader("Diagnostics")
         test_query = st.sidebar.text_input("Test query")
@@ -420,7 +415,7 @@ def setup_sidebar() -> tuple:
     return max_results, min_relevance
 
 def display_video(video: dict):
-    """Display video analysis results"""
+    """Display video analysis results with keyword cloud"""
     with st.container():
         col1, col2 = st.columns([1, 2])
         with col1:
@@ -460,6 +455,12 @@ def display_video(video: dict):
             
             st.markdown("#### AI Analysis")
             st.write(video["analysis"]["summary"])
+            
+            transcript = TranscriptService.get_transcript(video['video_id'])
+            if transcript:
+                keywords = " ".join(set(transcript.lower().split()) - {'the', 'a', 'and', 'to', 'in', 'is', 'of'})
+                st.markdown("**Top Keywords:**")
+                st.write(keywords[:200] + "..." if len(keywords) > 200 else keywords)
 
 def get_analyzer():
     """Initialize and return analyzer instance"""
@@ -469,7 +470,7 @@ def get_analyzer():
     return AnalysisEngine(youtube_client, ai_service)
 
 def main():
-    """Main application with real-time updates"""
+    """Main application with tabs and new features"""
     st.title("🎥 YouTube Content Analyzer")
     max_results, min_relevance = setup_sidebar()
     
@@ -478,27 +479,64 @@ def main():
     
     if st.button("Analyze Videos", type="primary", use_container_width=True) and query:
         with results_placeholder.container():
-            st.write("🚀 Starting analysis...")
+            tab1, tab2 = st.tabs(["📺 Videos", "📋 Summary"])
+            analyzer = get_analyzer()
+            relevant_videos = []
             
-            try:
-                analyzer = get_analyzer()
-                results_container = st.container()
-                relevant_videos = []
-                
+            with st.spinner("Analyzing videos..."):
                 results = analyzer.full_analysis(query, max_results)
                 for result in results:
                     if result.get("status") == "complete" and result.get("relevance", 0) >= min_relevance:
                         relevant_videos.append(result)
-                        with results_container:
-                            display_video(result)
-                            st.divider()
-                
-                if not relevant_videos:
+            
+            with tab1:
+                if relevant_videos:
+                    for video in relevant_videos:
+                        display_video(video)
+                        st.divider()
+                else:
                     st.warning("No relevant videos found matching your criteria")
+            
+            with tab2:
+                if relevant_videos:
+                    df = pd.DataFrame([{
+                        'Title': v['title'],
+                        'Relevance': f"{v.get('relevance', 0):.2f}",
+                        'Summary': v['analysis'].get('summary', 'No summary available'),
+                        'Views': v['analysis']['stats'].get('views', 0),
+                        'Engagement': f"{v['analysis'].get('engagement', 0):.1f}%",
+                        'Link': f"https://youtube.com/watch?v={v['video_id']}"
+                    } for v in relevant_videos])
                     
-            except Exception as e:
-                st.error(f"Analysis failed: {str(e)}")
-                logger.exception("Main analysis error")
+                    st.dataframe(
+                        df,
+                        column_config={
+                            "Link": st.column_config.LinkColumn(),
+                            "Views": st.column_config.NumberColumn(format="%d"),
+                            "Relevance": st.column_config.NumberColumn(format="%.2f")
+                        },
+                        hide_index=True,
+                        use_container_width=True
+                    )
+                    
+                    csv = df.to_csv(index=False)
+                    st.download_button(
+                        label="Download Summary as CSV",
+                        data=csv,
+                        file_name=f"youtube_analysis_{datetime.now().strftime('%Y%m%d')}.csv",
+                        mime="text/csv"
+                    )
+                    
+                    fig = px.bar(
+                        df,
+                        x="Title",
+                        y="Engagement",
+                        title="Engagement by Video",
+                        hover_data=["Summary"]
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("No analysis available yet")
 
 def keep_alive():
     """Maintain application wake status"""
