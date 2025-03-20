@@ -1,3 +1,4 @@
+from streamlit.runtime.scriptrunner import add_script_run_ctx
 import streamlit as st
 import requests
 import pandas as pd
@@ -7,7 +8,6 @@ from youtube_transcript_api import YouTubeTranscriptApi
 from textblob import TextBlob
 import os
 from requests.exceptions import Timeout
-from streamlit.report_thread import add_report_ctx
 from threading import Thread
 import time
 import logging
@@ -347,7 +347,7 @@ if __name__ == "__main__":
     
     # Start keep-alive thread
     t = Thread(target=keep_alive)
-    add_report_ctx(t)
+    add_script_run_ctx(t)  # Updated method
     t.daemon = True
     t.start()
     
