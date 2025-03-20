@@ -71,29 +71,30 @@ class AIService:
         return None
 
     def analyze_with_gemini(self, text: str) -> Optional[str]:
-        """Analyze text using Google's Gemini API"""
-        for attempt in range(MAX_RETRIES):
-            try:
-                response = requests.post(
-                    self.gemini_url,
-                    json={
-                        "contents": [{
-                            "parts": [{"text": text[:MAX_TRANSCRIPT_LENGTH]}]
-                        }],
-                    params={"key": self.gemini_api_key},
-                    headers={"Content-Type": "application/json"},
-                    timeout=REQUEST_TIMEOUT
-                )
-                response.raise_for_status()
-                return response.json()["candidates"][0]["content"]["parts"][0]["text"]
-            except Timeout:
-                logger.warning("Gemini API timeout (attempt %d/%d)", attempt+1, MAX_RETRIES)
-                if attempt == MAX_RETRIES-1:
-                    return None
-                time.sleep(RETRY_DELAY)
-            except Exception as e:
-                return self._handle_api_error(e, "Gemini")
-        return None
+    """Analyze text using Google's Gemini API"""
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = requests.post(
+                self.gemini_url,
+                json={
+                    "contents": [{
+                        "parts": [{"text": text[:MAX_TRANSCRIPT_LENGTH]}]
+                    }]
+                },  # Fixed: Added missing closing brace for json parameter
+                params={"key": self.gemini_api_key},
+                headers={"Content-Type": "application/json"},
+                timeout=REQUEST_TIMEOUT
+            )
+            response.raise_for_status()
+            return response.json()["candidates"][0]["content"]["parts"][0]["text"]
+        except Timeout:
+            logger.warning("Gemini API timeout (attempt %d/%d)", attempt+1, MAX_RETRIES)
+            if attempt == MAX_RETRIES-1:
+                return None
+            time.sleep(RETRY_DELAY)
+        except Exception as e:
+            return self._handle_api_error(e, "Gemini")
+    return None
 
     def analyze_with_openrouter(self, text: str) -> Optional[str]:
         """Fallback analysis using OpenRouter API"""
