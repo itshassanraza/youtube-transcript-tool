@@ -1,13 +1,14 @@
 # app.py
 from streamlit.runtime.scriptrunner import add_script_run_ctx
 import streamlit as st
+import os
+os.environ["STREAMLIT_GLOBAL_DISABLE_SECRETS_WARNING"] = "true"
 import requests
 import pandas as pd
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 from youtube_transcript_api import YouTubeTranscriptApi
 from textblob import TextBlob
-import os
 from requests.exceptions import Timeout
 from threading import Thread
 import time
@@ -108,7 +109,7 @@ class AIService:
                 },
                 headers={
                     "Authorization": f"Bearer {self.openrouter_api_key}",
-                    "HTTP-Referer": st.secrets.get("APP_URL", "https://github.com/"),
+                    "HTTP-Referer": os.environ.get("APP_URL", "https://github.com/"),
                     "Content-Type": "application/json"
                 },
                 timeout=REQUEST_TIMEOUT
